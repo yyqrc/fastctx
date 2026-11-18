@@ -222,6 +222,44 @@ fn stdio_grep_and_glob_errors_obey_tiny_budgets_with_an_independent_oracle() {
 }
 
 #[test]
+fn compact_search_preserves_paths_counts_and_grouped_encoding_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = normalized(temp.path());
+    write(&temp.path().join("sub/hit.txt"), b"needle needle");
+    for name in ["a.txt", "b.txt"] {
+        write(
+            &temp.path().join(name),
+            b"probe \xd6\xd0\xce\xc4\xc3\xfc\xd6\xd0\n",
+        );
+    }
+    let grep = |compact| {
+        let args = serde_json::json!({"path": root, "pattern": "needle",
+            "output_mode": "count", "compact": compact});
+        text(grep_files(serde_json::from_value(args).unwrap()))
+    };
+    let original = grep(false);
+    let compact = grep(true);
+    assert!(original.contains(&format!("{root}/sub/hit.txt:2")));
+    assert!(compact.lines().any(|line| line == "sub/hit.txt:2"));
+    assert!(!compact.contains(&root));
+    assert_eq!(compact.matches("ambiguous:").count(), 1, "{compact}");
+    for name in ["a.txt", "b.txt"] {
+        assert!(
+            compact.lines().any(|line| line.trim_start() == name),
+            "{compact}"
+        );
+    }
+    assert_eq!(original.lines().last(), compact.lines().last());
+
+    let args = serde_json::json!({"path":root, "pattern":"**/hit.txt",
+        "compact":true, "output_mode":"details"});
+    let output = text(glob_files(serde_json::from_value(args).unwrap()));
+    let detail: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+    assert_eq!(detail["path"], "sub/hit.txt");
+    assert_eq!(detail["bytes"], 13);
+}
+
+#[test]
 fn read_offset_pages_reassemble_without_duplicates_or_gaps_across_a_matrix() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("read-pages.txt");
@@ -262,8 +300,9 @@ fn read_offset_pages_reassemble_without_duplicates_or_gaps_across_a_matrix() {
                     assert_eq!(value, &expected[expected_number - 1], "{output}");
                     actual.push(value.clone());
                 }
+                assert_eq!(page.len(), page_width.min(total + 1 - offset));
+                assert!(terminal.starts_with("(Complete:"), "{terminal}");
                 offset += page.len();
-                assert_terminal_matches_more(terminal, offset <= total);
             }
             assert_eq!(actual, expected, "total={total}, page_width={page_width}");
         }
@@ -271,7 +310,7 @@ fn read_offset_pages_reassemble_without_duplicates_or_gaps_across_a_matrix() {
 }
 
 #[test]
-fn batch_read_continuation_chain_matches_independent_per_file_line_oracles() {
+fn batch_read_respects_the_requested_limit_of_each_file() {
     let temp = tempfile::tempdir().unwrap();
     let fixtures = [3_usize, 7, 31]
         .into_iter()
@@ -353,6 +392,7 @@ fn batch_read_continuation_chain_matches_independent_per_file_line_oracles() {
         }
 
         for (path, expected) in &fixtures {
+            let expected = &expected[..page_width.min(expected.len())];
             let delivered = actual.remove(&normalized(path)).unwrap();
             assert_eq!(
                 delivered.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
@@ -363,7 +403,7 @@ fn batch_read_continuation_chain_matches_independent_per_file_line_oracles() {
                     .into_iter()
                     .map(|(_, value)| value)
                     .collect::<Vec<_>>(),
-                *expected
+                expected
             );
         }
         assert!(actual.is_empty());
@@ -397,6 +437,7 @@ fn grep_occurrence_pages_reassemble_without_duplicates_or_gaps_across_a_matrix()
             let output = text(grep_files(GrepRequest {
                 pattern: "HIT".to_string(),
                 path: Some(normalized(&path)),
+                compact: None,
                 glob: None,
                 file_type: None,
                 output_mode: Some(OutputMode::Content),
@@ -446,6 +487,7 @@ fn glob_offset_pages_reassemble_without_duplicates_or_gaps_across_a_matrix() {
             let output = text(glob_files(GlobRequest {
                 pattern: fastctx::glob_filter::GlobPatterns::One("**/*.dat".to_string()),
                 path: Some(normalized(&root)),
+                compact: None,
                 filter_mode: Some(FilterMode::All),
                 sort: Some(SortMode::Path),
                 output_mode: None,

@@ -115,15 +115,22 @@ impl PathRecord {
         metadata: &Metadata,
         include_modified: bool,
     ) -> io::Result<Self> {
-        let mut record = Self::without_metadata(native, match_root);
-        record.modified = if include_modified {
+        Self::without_metadata(native, match_root).with_metadata(metadata, include_modified)
+    }
+
+    pub(crate) fn with_metadata(
+        mut self,
+        metadata: &Metadata,
+        include_modified: bool,
+    ) -> io::Result<Self> {
+        self.modified = if include_modified {
             Some(metadata.modified()?)
         } else {
             None
         };
-        record.traversal_len_hint = Some(metadata.len());
-        record.traversal_fingerprint = Some(FileIdentityHint::from_metadata(metadata));
-        Ok(record)
+        self.traversal_len_hint = Some(metadata.len());
+        self.traversal_fingerprint = Some(FileIdentityHint::from_metadata(metadata));
+        Ok(self)
     }
 }
 
@@ -157,6 +164,18 @@ impl ResolvedRoot {
 
     pub(crate) fn is_file(&self) -> bool {
         self.kind == RootKind::File
+    }
+
+    /// Shorten only a descendant of this directory, on a component boundary.
+    pub(crate) fn output_path<'a>(&self, display: &'a str, compact: bool) -> &'a str {
+        if compact && !self.is_file() {
+            display
+                .strip_prefix(self.display.trim_end_matches('/'))
+                .and_then(|tail| tail.strip_prefix('/'))
+                .unwrap_or(display)
+        } else {
+            display
+        }
     }
 
     pub(crate) fn match_root(&self) -> &Path {

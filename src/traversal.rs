@@ -307,7 +307,7 @@ fn collect_directory_candidates(
         if !matches_record(&preliminary, glob, None) {
             return Ok(None);
         }
-        candidate_from_entry(entry, &root.native)
+        candidate_from_entry(entry, preliminary)
     })
 }
 
@@ -621,46 +621,29 @@ fn matches_record(
     glob.is_none_or(|glob| glob.is_match(candidate.relative_match.as_ref()))
 }
 
-fn candidate_from_path(
-    path: &Path,
-    match_root: &Path,
-) -> Result<Option<PathRecord>, TraversalFailure> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(TraversalFailure::from_io(path, &error)),
-    };
-    candidate_from_metadata(path, match_root, &metadata).map(Some)
-}
-
 /// Symlinks follow their target for the regular-file check and ordering metadata.
 fn candidate_from_entry(
     entry: &ignore::DirEntry,
-    match_root: &Path,
+    candidate: PathRecord,
 ) -> Result<Option<PathRecord>, TraversalFailure> {
-    if entry
+    let path = entry.path();
+    let metadata = if entry
         .file_type()
         .is_some_and(|file_type| file_type.is_symlink())
     {
-        return candidate_from_path(entry.path(), match_root);
-    }
-    match entry.metadata() {
-        Ok(metadata) if metadata.is_file() => {
-            candidate_from_metadata(entry.path(), match_root, &metadata).map(Some)
-        }
+        fs::metadata(path)
+    } else {
+        entry.metadata().or_else(|_| fs::metadata(path))
+    };
+    match metadata {
+        Ok(metadata) if metadata.is_file() => candidate
+            .with_metadata(&metadata, true)
+            .map(Some)
+            .map_err(|error| TraversalFailure::from_io(path, &error)),
         Ok(_) => Ok(None),
-        Err(_) => candidate_from_path(entry.path(), match_root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(TraversalFailure::from_io(path, &error)),
     }
-}
-
-fn candidate_from_metadata(
-    path: &Path,
-    match_root: &Path,
-    metadata: &fs::Metadata,
-) -> Result<PathRecord, TraversalFailure> {
-    PathRecord::from_metadata(path, match_root, metadata, true)
-        .map_err(|error| TraversalFailure::from_io(path, &error))
 }
 
 fn operation_cancelled(operation: Option<&OperationCtx>) -> bool {

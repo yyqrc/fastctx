@@ -73,6 +73,8 @@ pub struct GrepRequest {
         "File or directory to search. Omit for the session working directory."
     ))]
     pub path: Option<String>,
+    /// For directory queries, return paths relative to the search root and group repeated skip reasons.
+    pub compact: Option<bool>,
     /// Globs to filter files, e.g. ["**/*.rs", "!tests/**"]. A leading `!` excludes and always wins; negative-only lists include every other file.
     // Published as a plain string array; see the note on GlobRequest::pattern. (2026-08-17)
     #[schemars(with = "Option<Vec<String>>")]
@@ -210,6 +212,7 @@ struct PageFormat<'a> {
     budget_variable: &'a str,
     scan_complete: bool,
     total_entries_seen: usize,
+    compact: bool,
     skipped_files: &'a SkippedFiles,
     transcoding_notes: &'a BTreeSet<String>,
     fallback_usage: &'a FallbackUsage,
@@ -230,11 +233,15 @@ impl SkippedFiles {
     /// Seeds the report with paths the walk never entered. Traversal happens
     /// before any file is searched, so its entries lead the detail list and the
     /// split point stays a simple prefix length.
-    fn from_traversal(skipped: &SkippedPaths) -> Self {
+    fn from_traversal(
+        skipped: &SkippedPaths,
+        root: &crate::path_codec::ResolvedRoot,
+        compact: bool,
+    ) -> Self {
         let entries = skipped
             .listed()
             .map(|path| SkippedFile {
-                path: path.display.to_string(),
+                path: root.output_path(path.display, compact).to_owned(),
                 reason: path.reason.to_string(),
             })
             .collect::<Vec<_>>();
@@ -440,7 +447,8 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         Ok(glob) => glob,
         Err(message) => return ToolResponse::error(message),
     };
-    let collected = match collect_search_candidates(
+    let compact = request.compact.unwrap_or(false) && !single_file_target;
+    let mut collected = match collect_search_candidates(
         &root,
         glob.as_ref(),
         request.file_type.as_deref(),
@@ -450,6 +458,11 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         Ok(collected) => collected,
         Err(message) => return ToolResponse::error(message),
     };
+    if compact {
+        for candidate in &mut collected.items {
+            candidate.display = Arc::clone(&candidate.relative_match);
+        }
+    }
     let traversal_skips = collected.skipped;
     let candidates = Arc::<[Candidate]>::from(collected.items);
     let offset = request.offset.unwrap_or(0);
@@ -471,7 +484,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     if mode == OutputMode::Summary {
         let mut occurrence_total = 0_usize;
         let mut file_total = 0_usize;
-        let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips);
+        let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips, &root, compact);
         let mut transcoding_notes = BTreeSet::new();
         let mut fallback_usage = FallbackUsage::default();
         let plan = GrepSearchPlan::Count;
@@ -548,6 +561,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
             budget_variable,
             scan_complete: true,
             total_entries_seen: 0,
+            compact,
             skipped_files: &skipped_files,
             transcoding_notes: &transcoding_notes,
             fallback_usage: &fallback_usage,
@@ -570,7 +584,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     let mut skip_remaining = offset;
     let mut total_entries_seen = 0_usize;
     let mut scan_complete = true;
-    let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips);
+    let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips, &root, compact);
     let mut transcoding_notes = BTreeSet::new();
     let mut fallback_usage = FallbackUsage::default();
     // Every candidate is searched with identical options so files can run in
@@ -753,6 +767,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         budget_variable,
         scan_complete,
         total_entries_seen,
+        compact,
         skipped_files: &skipped_files,
         transcoding_notes: &transcoding_notes,
         fallback_usage: &fallback_usage,
@@ -1162,12 +1177,34 @@ impl GrepNoteUnits {
             .iter()
             .map(|line| Arc::<str>::from(line.as_str()))
             .collect();
-        let details = page
-            .skipped_files
-            .entries
-            .iter()
-            .map(|entry| Arc::<str>::from(detail_line(&entry.path, &entry.reason)))
-            .collect();
+        let mut details = Vec::with_capacity(page.skipped_files.entries.len());
+        if page.compact {
+            let mut groups = BTreeMap::<&str, Vec<&str>>::new();
+            for entry in &page.skipped_files.entries {
+                groups.entry(&entry.reason).or_default().push(&entry.path);
+            }
+            for (reason, paths) in groups {
+                if let [path] = paths.as_slice() {
+                    details.push(Arc::from(detail_line(path, reason)));
+                } else {
+                    // One unit per path keeps the budgeted prefix and skip tally in sync.
+                    for (index, path) in paths.into_iter().enumerate() {
+                        details.push(Arc::from(if index == 0 {
+                            format!("{reason}:\n  {path}")
+                        } else {
+                            format!("  {path}")
+                        }));
+                    }
+                }
+            }
+        } else {
+            details.extend(
+                page.skipped_files
+                    .entries
+                    .iter()
+                    .map(|entry| Arc::<str>::from(detail_line(&entry.path, &entry.reason))),
+            );
+        }
         let fallback = page.fallback_usage.note().map(Arc::<str>::from);
         Self {
             fixed,

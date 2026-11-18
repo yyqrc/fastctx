@@ -280,9 +280,8 @@ impl LineCollector {
                 ));
             }
             let last = self.offset.saturating_add(shown.saturating_sub(1));
-            let truncated = self.stopped_early
-                || self.storage_saturated
-                || (shown > 0 && last < self.total_lines);
+            let truncated = last < self.request_end
+                && (self.stopped_early || self.storage_saturated || last < self.total_lines);
             let notes = read_notes(
                 transcoding_note.as_deref(),
                 truncated,
@@ -290,6 +289,7 @@ impl LineCollector {
                 shown,
                 self.total_lines,
                 self.total_is_known,
+                (self.request_end < usize::MAX).then(|| self.request_end.saturating_sub(last)),
             );
             let output = assemble_text(&self.rendered, &notes);
             if estimate_tokens(&output) <= budget.value {
@@ -313,6 +313,7 @@ fn read_notes(
     shown: usize,
     total: usize,
     total_is_known: bool,
+    remaining_limit: Option<usize>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     if let Some(note) = transcoding_note {
@@ -322,17 +323,20 @@ fn read_notes(
         let last = offset + shown - 1;
         let span = line_span(offset, last);
         if truncated {
-            if total_is_known {
-                notes.push(format!(
-                    "(Partial: {span} of {total} shown. Continue with offset={}.)",
-                    last + 1
-                ));
+            let total = if total_is_known {
+                format!(" of {total}")
             } else {
-                notes.push(format!(
-                    "(Partial: {span} shown. Continue with offset={}.)",
-                    last + 1
-                ));
-            }
+                String::new()
+            };
+            let limit = remaining_limit
+                .map(|n| format!(", limit={n}"))
+                .unwrap_or_default();
+            notes.push(format!(
+                "(Partial: {span}{total} shown. Continue with offset={}{limit}.)",
+                last + 1
+            ));
+        } else if last < total {
+            notes.push(format!("(Complete: requested {span} shown.)"));
         } else {
             notes.push(format!(
                 "(Complete: reached end of file; {span} of {total} shown.)"

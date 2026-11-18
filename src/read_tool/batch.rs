@@ -335,7 +335,7 @@ fn progress_after(
     shown: usize,
 ) -> Option<ContinuationEntry> {
     let last = content.first.saturating_add(shown.saturating_sub(1));
-    if last >= content.total_lines {
+    if last >= content.total_lines || entry.limit.is_some_and(|limit| shown >= limit) {
         return None;
     }
     Some(ContinuationEntry {

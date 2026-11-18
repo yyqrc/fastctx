@@ -12,6 +12,7 @@ fn request(path: &std::path::Path, pattern: &str) -> GlobRequest {
     GlobRequest {
         pattern: GlobPatterns::One(pattern.to_string()),
         path: Some(normalized(path)),
+        compact: None,
         filter_mode: None,
         sort: None,
         output_mode: None,

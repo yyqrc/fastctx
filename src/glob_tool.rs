@@ -96,6 +96,8 @@ pub struct GlobRequest {
         "Directory to search. Omit for the session working directory; when provided, it must name an existing directory."
     ))]
     pub path: Option<String>,
+    /// Return paths relative to the search directory, including paths in details and skip notes.
+    pub compact: Option<bool>,
     /// "ignore" respects only plain .ignore files; "all" disables that filtering. Both include hidden files and .git, and neither reads any Git ignore source. The legacy value "project" is accepted as "ignore" but is not published.
     pub filter_mode: Option<FilterMode>,
     /// "path" = byte-order path sort. "modified" = most recently modified first.
@@ -177,20 +179,12 @@ fn glob_files_with_execution_unadapted(
         ));
     }
     let sort = request.sort.unwrap_or_default();
-    let output_mode = request.output_mode.unwrap_or_default();
-    let collected = match collect_matches(
-        &root,
-        &matcher,
-        request.filter_mode.unwrap_or_default(),
-        sort,
-        output_mode,
-        operation,
-        executor,
-    ) {
+    let compact = request.compact.unwrap_or(false);
+    let collected = match collect_matches(&root, &matcher, &request, operation, executor) {
         Ok(collected) => collected,
         Err(message) => return ToolResponse::error(message),
     };
-    let report = SkipReport::new(&collected.skipped);
+    let report = SkipReport::new(&collected.skipped, &root, compact);
     let matches = match sort_cancelable(
         collected.items,
         move |left, right| compare_match_entries(sort, left, right),
@@ -235,9 +229,7 @@ fn glob_error(error: &impl std::fmt::Display) -> String {
 fn collect_matches(
     root: &ResolvedRoot,
     matcher: &PathGlobFilter,
-    filter_mode: FilterMode,
-    sort: SortMode,
-    output_mode: GlobOutputMode,
+    request: &GlobRequest,
     operation: &OperationCtx,
     executor: &Arc<GrepGlobExecutor>,
 ) -> Result<TraversalCollection<MatchEntry>, String> {
@@ -245,7 +237,7 @@ fn collect_matches(
         return Err("Request cancelled.".to_string());
     }
     let mut builder = WalkBuilder::new(&root.native);
-    match filter_mode {
+    match request.filter_mode.unwrap_or_default() {
         FilterMode::Ignore => {
             builder
                 .standard_filters(false)
@@ -280,7 +272,7 @@ fn collect_matches(
             {
                 return Ok(None);
             }
-            evaluate_match(root, entry, matcher, sort, output_mode)
+            evaluate_match(root, entry, matcher, request)
         },
     )
 }
@@ -311,9 +303,11 @@ fn evaluate_match(
     root: &ResolvedRoot,
     entry: &ignore::DirEntry,
     matcher: &PathGlobFilter,
-    sort: SortMode,
-    output_mode: GlobOutputMode,
+    request: &GlobRequest,
 ) -> Result<Option<MatchEntry>, TraversalFailure> {
+    let sort = request.sort.unwrap_or_default();
+    let output_mode = request.output_mode.unwrap_or_default();
+    let compact = request.compact.unwrap_or(false);
     let path = entry.path();
     let preliminary = PathRecord::without_metadata(path, &root.native);
     if !matcher.is_match(preliminary.relative_match.as_ref()) {
@@ -325,7 +319,11 @@ fn evaluate_match(
             .file_type()
             .is_some_and(|file_type| file_type.is_file())
     {
-        let rendered = Arc::clone(&preliminary.display);
+        let rendered = Arc::clone(if compact {
+            &preliminary.relative_match
+        } else {
+            &preliminary.display
+        });
         return Ok(Some(MatchEntry {
             path: preliminary,
             rendered,
@@ -357,12 +355,19 @@ fn evaluate_match(
         }
     };
     let include_modified = sort == SortMode::Modified || output_mode == GlobOutputMode::Details;
-    let record = PathRecord::from_metadata(path, &root.native, &metadata, include_modified)
+    let record = preliminary
+        .with_metadata(&metadata, include_modified)
         .map_err(|error| TraversalFailure::from_io(path, &error))?;
-    let rendered = if output_mode == GlobOutputMode::Details {
-        format_match_details(&record).map_err(|error| TraversalFailure::from_io(path, &error))?
+    let output_path = if compact {
+        &record.relative_match
     } else {
-        Arc::clone(&record.display)
+        &record.display
+    };
+    let rendered = if output_mode == GlobOutputMode::Details {
+        format_match_details(&record, output_path)
+            .map_err(|error| TraversalFailure::from_io(path, &error))?
+    } else {
+        Arc::clone(output_path)
     };
     Ok(Some(MatchEntry {
         path: record,
@@ -377,7 +382,7 @@ struct MatchDetails<'a> {
     modified: &'a str,
 }
 
-fn format_match_details(record: &PathRecord) -> io::Result<Arc<str>> {
+fn format_match_details(record: &PathRecord, path: &str) -> io::Result<Arc<str>> {
     let bytes = record
         .traversal_len_hint
         .ok_or_else(|| io::Error::other("glob detail metadata is missing the file size"))?;
@@ -386,7 +391,7 @@ fn format_match_details(record: &PathRecord) -> io::Result<Arc<str>> {
         .ok_or_else(|| io::Error::other("glob detail metadata is missing the modification time"))?;
     let modified = format_modified_utc(modified)?;
     serde_json::to_string(&MatchDetails {
-        path: &record.display,
+        path,
         bytes,
         modified: &modified,
     })
@@ -424,10 +429,15 @@ struct SkipReport {
 }
 
 impl SkipReport {
-    fn new(skipped: &SkippedPaths) -> Self {
+    fn new(skipped: &SkippedPaths, root: &ResolvedRoot, compact: bool) -> Self {
         let details = skipped
             .listed()
-            .map(|path| Arc::<str>::from(detail_line(path.display, path.reason)))
+            .map(|path| {
+                Arc::<str>::from(detail_line(
+                    root.output_path(path.display, compact),
+                    path.reason,
+                ))
+            })
             .collect::<Vec<_>>();
         Self {
             tally: SkipTally {
