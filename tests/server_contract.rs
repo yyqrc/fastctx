@@ -615,6 +615,10 @@ fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
     );
     let initialized = read_response(&mut stdout);
     assert_eq!(initialized["id"], 1);
+    assert_eq!(
+        initialized["result"]["serverInfo"]["version"],
+        concat!(env!("CARGO_PKG_VERSION"), "+", env!("FASTCTX_BUILD_ID"))
+    );
     assert!(initialized["result"]["capabilities"]["tools"].is_object());
     assert!(
         initialized["result"]["capabilities"]

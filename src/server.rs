@@ -288,7 +288,7 @@ impl ServerHandler for FastCtxServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
+                concat!(env!("CARGO_PKG_VERSION"), "+", env!("FASTCTX_BUILD_ID")),
             ))
             // 2026-07-24: hosts render these instructions as the tool namespace's one-line
             // blurb and may keep only its first line and first 250 characters, so this text
