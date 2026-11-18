@@ -4,7 +4,7 @@ use crate::budget::{GLOB_TOKEN_BUDGET_ENV, GREP_TOKEN_BUDGET_ENV, READ_TOKEN_BUD
 use crate::edit::ReplaceService;
 use crate::file_executor::GrepGlobExecutor;
 use crate::glob_tool::{GlobRequest, glob_files_cancellable};
-use crate::grep_tool::{GrepRequest, grep_files_cancellable};
+use crate::grep_tool::{GrepPageCache, GrepRequest, grep_files_cancellable};
 use crate::read_tool::{ReadRequest, read_file};
 use crate::server_manifest::{ToolContract, ToolManifest};
 use crate::server_support::{
@@ -47,6 +47,7 @@ pub struct FastCtxServer {
     pub(crate) replace: ReplaceService,
     pub(crate) file_permits: Arc<Semaphore>,
     pub(crate) grep_glob_executor: Arc<GrepGlobExecutor>,
+    grep_pages: Arc<GrepPageCache>,
     pub(crate) shell_permits: Arc<Semaphore>,
     pub(crate) replace_permits: Arc<Semaphore>,
     pub(crate) session: Arc<SessionContext>,
@@ -153,6 +154,7 @@ impl FastCtxServer {
             replace: runtime.replace.clone(),
             file_permits: Arc::clone(&runtime.file_permits),
             grep_glob_executor: Arc::clone(&runtime.grep_glob_executor),
+            grep_pages: Arc::default(),
             shell_permits: Arc::clone(&runtime.shell_permits),
             replace_permits: Arc::clone(&runtime.replace_permits),
             activity: Arc::clone(&runtime.activity),
@@ -228,6 +230,7 @@ impl FastCtxServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let _activity = self.activity.request();
+        let pages = Arc::clone(&self.grep_pages);
         run_blocking_cancellable(
             CancellableBlockingRequest::new(
                 Arc::clone(&self.session),
@@ -241,7 +244,9 @@ impl FastCtxServer {
                 let shell = self.shell.clone();
                 move || shell.background_status(None)
             },
-            move |operation, executor| grep_files_cancellable(operation, executor, request.clone()),
+            move |operation, executor| {
+                grep_files_cancellable(operation, executor, request.clone(), &pages)
+            },
         )
         .await
     }

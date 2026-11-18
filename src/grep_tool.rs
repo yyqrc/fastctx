@@ -9,7 +9,9 @@ use crate::encoding::{
     canonical_encoding_label, validate_snapshot_encoding,
 };
 use crate::file_executor::GrepGlobExecutor;
-use crate::file_snapshot::{CaptureDisposition, CaptureFailure, capture_classify};
+use crate::file_snapshot::{
+    CaptureDisposition, CaptureFailure, PagingStamp, capture_classify, paging_volume,
+};
 use crate::glob_filter::{GlobPatterns, PathGlobFilter};
 use crate::grep_sink::{
     CapturedLine, ContentEntry, ContentSpec, FileResult, GrepSearchPlan, GrepSinkError,
@@ -46,6 +48,8 @@ const MATCH_WINDOW_SIDE_CHARS: usize = 100;
 const MAX_MATCH_CHARS: usize = 2_000;
 const SEARCH_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const CAPTURE_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+// Only the leading candidates can save work on a subsequent offset page.
+const PAGING_STAMP_LIMIT: usize = 32 * 1024;
 
 /// The grep output modes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq)]
@@ -67,7 +71,7 @@ pub enum OutputMode {
 }
 
 /// Parameters for the grep tool.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GrepRequest {
     /// The regular expression to search for (Rust regex syntax; escape literal braces like `interface\{\}`).
@@ -121,6 +125,25 @@ struct SearchOutcome {
     skip: Option<CandidateSkip>,
     transcoding_note: Option<String>,
     used_fallback: bool,
+    paging_stamp: Option<PagingStamp>,
+}
+
+/// At most one query per MCP connection. Only proven misses are retained.
+#[derive(Debug, Default)]
+pub(crate) struct GrepPageCache(parking_lot::Mutex<Option<CachedPage>>);
+
+#[derive(Debug)]
+struct CachedPage {
+    request: GrepRequest,
+    volume_serial: u64,
+    journal_id: u64,
+    stamps: Arc<[Option<PagingStamp>]>,
+}
+
+#[derive(Clone)]
+struct PageReuse {
+    volume: u64,
+    stamps: Arc<[Option<PagingStamp>]>,
 }
 
 enum CandidateSkip {
@@ -336,6 +359,7 @@ pub fn grep_files(request: GrepRequest, cancellation: CancellationToken) -> Tool
         CAPTURE_HEAP_LIMIT_BYTES,
         operation,
         GrepGlobExecutor::shared(),
+        None,
     );
     guard.disarm();
     response
@@ -346,6 +370,7 @@ pub(crate) fn grep_files_cancellable(
     operation: OperationCtx,
     executor: Arc<GrepGlobExecutor>,
     request: GrepRequest,
+    page_cache: &GrepPageCache,
 ) -> Result<ToolResponse, OpError> {
     let work = operation.inline_work();
     work.check_inline()?;
@@ -366,6 +391,7 @@ pub(crate) fn grep_files_cancellable(
         CAPTURE_HEAP_LIMIT_BYTES,
         operation.clone(),
         executor,
+        Some(page_cache),
     );
     work.check_inline()?;
     Ok(response)
@@ -378,6 +404,7 @@ fn grep_files_with_budget_source_and_execution(
     capture_heap_limit_bytes: usize,
     operation: OperationCtx,
     executor: Arc<GrepGlobExecutor>,
+    page_cache: Option<&GrepPageCache>,
 ) -> ToolResponse {
     let adapter = ErrorBudgetAdapter::new(budget, budget_variable);
     adapter.adapt(grep_files_with_budget_source_and_execution_unadapted(
@@ -387,6 +414,7 @@ fn grep_files_with_budget_source_and_execution(
         capture_heap_limit_bytes,
         operation,
         executor,
+        page_cache,
     ))
 }
 
@@ -397,6 +425,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     capture_heap_limit_bytes: usize,
     operation: OperationCtx,
     executor: Arc<GrepGlobExecutor>,
+    page_cache: Option<&GrepPageCache>,
 ) -> ToolResponse {
     let root_input = request.path.clone();
     let root = match resolve_search_root(root_input.as_deref(), RootRequirement::FileOrDirectory) {
@@ -506,6 +535,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
             multiline,
             search_encoding,
             usize::MAX,
+            None,
             |index, outcome, _| {
                 let candidate = &candidates[index];
                 let outcome = match outcome {
@@ -609,6 +639,37 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         OutputMode::Summary => unreachable!("summary is handled before paging"),
     };
     let mut failure: Option<String> = None;
+    let mut reuse = page_cache
+        // Explicit offset=0 can prime the cache. Ordinary single calls skip
+        // the extra journal reads needed to prove cross-request reuse.
+        .filter(|_| {
+            request.offset.is_some()
+                && !single_file_target
+                && candidates.len() > executor.parallelism()
+        })
+        .and_then(|cache| {
+            let volume = paging_volume(&root.native)?;
+            let mut key = request.clone();
+            key.offset = None;
+            let previous = cache.0.lock();
+            let stamps = previous
+                .as_ref()
+                .filter(|entry| {
+                    offset > 0
+                        && entry.request == key
+                        && entry.volume_serial == volume.serial
+                        && entry.journal_id == volume.journal_id
+                })
+                .map_or_else(|| Arc::from([]), |entry| Arc::clone(&entry.stamps));
+            let reuse = PageReuse {
+                volume: volume.serial,
+                stamps,
+            };
+            Some((cache, key, volume, reuse, Vec::new()))
+        });
+    let page_reuse = reuse
+        .as_ref()
+        .map(|(_, _, _, previous, _)| previous.clone());
     let ordered = search_candidates_ordered(
         Arc::clone(&candidates),
         operation.clone(),
@@ -618,6 +679,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         multiline,
         search_encoding.clone(),
         effective_head_limit,
+        page_reuse,
         |index, outcome, retire_generation| {
             let candidate = &candidates[index];
             let (outcome, exact_form) = match outcome {
@@ -646,6 +708,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
                         multiline,
                         &search_encoding,
                         Some(&exact_work),
+                        None,
                     ) {
                         Ok(outcome) => (outcome, true),
                         Err(SearchFailure::CaptureOverflow) if !single_file_target => {
@@ -672,6 +735,13 @@ fn grep_files_with_budget_source_and_execution_unadapted(
                     return ControlFlow::Break(());
                 }
             };
+            if index < PAGING_STAMP_LIMIT
+                && let Some((_, _, _, _, stamps)) = &mut reuse
+                && let Some(stamp) = outcome.paging_stamp
+            {
+                stamps.resize_with(index, || None);
+                stamps.push(Some(stamp));
+            }
             if let Some(skip) = outcome.skip {
                 if single_file_target {
                     failure = Some(skip.single_file_message(candidate));
@@ -740,6 +810,28 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     }
     if let Some(message) = failure {
         return ToolResponse::error(message);
+    }
+    if let Some((cache, key, volume, previous, stamps)) = reuse {
+        if volume.journal_unchanged() {
+            *cache.0.lock() = Some(CachedPage {
+                request: key,
+                volume_serial: volume.serial,
+                journal_id: volume.journal_id,
+                stamps: Arc::from(stamps),
+            });
+        } else if !previous.stamps.is_empty() {
+            // A journal reset during the search invalidates every tentative
+            // reuse. Retry once through the regular scan before formatting.
+            return grep_files_with_budget_source_and_execution_unadapted(
+                request,
+                budget,
+                budget_variable,
+                capture_heap_limit_bytes,
+                operation,
+                executor,
+                None,
+            );
+        }
     }
     let page = PageFormat {
         offset,
@@ -811,6 +903,7 @@ fn search_candidate(
     multiline: bool,
     encoding: &SearchEncoding,
     operation: Option<&dyn WorkCheckpoint>,
+    paging_volume: Option<u64>,
 ) -> Result<SearchOutcome, SearchFailure> {
     if let Some(content_multiline) = plan.content_multiline() {
         debug_assert_eq!(content_multiline, multiline);
@@ -820,6 +913,7 @@ fn search_candidate(
         encoding.explicit.as_deref(),
         encoding.fallback.as_deref(),
         operation,
+        paging_volume,
     ) {
         Ok(CaptureDisposition::Searchable(snapshot)) => snapshot,
         Ok(CaptureDisposition::BinarySkipped(proof)) => {
@@ -834,6 +928,7 @@ fn search_candidate(
                 skip: None,
                 transcoding_note: None,
                 used_fallback: false,
+                paging_stamp: None,
             });
         }
         Ok(CaptureDisposition::EncodingRejected { rejection, proof }) => {
@@ -844,6 +939,7 @@ fn search_candidate(
                 skip: Some(CandidateSkip::Encoding(rejection)),
                 transcoding_note: None,
                 used_fallback: false,
+                paging_stamp: None,
             });
         }
         Ok(CaptureDisposition::FileChanged) => {
@@ -853,6 +949,7 @@ fn search_candidate(
                 skip: Some(CandidateSkip::ChangedWhileSearched),
                 transcoding_note: None,
                 used_fallback: false,
+                paging_stamp: None,
             });
         }
         Err(CaptureFailure::Cancelled) => return Err(SearchFailure::Cancelled),
@@ -898,6 +995,7 @@ fn search_candidate(
                 skip: None,
                 transcoding_note: None,
                 used_fallback: false,
+                paging_stamp: None,
             });
         }
         EncodingDecision::Rejected(rejection) => match encoding.fallback.as_deref() {
@@ -914,6 +1012,7 @@ fn search_candidate(
                             skip: Some(CandidateSkip::Encoding(rejection)),
                             transcoding_note: None,
                             used_fallback: false,
+                            paging_stamp: None,
                         });
                     }
                 }
@@ -925,6 +1024,7 @@ fn search_candidate(
                     skip: Some(CandidateSkip::Encoding(rejection)),
                     transcoding_note: None,
                     used_fallback: false,
+                    paging_stamp: None,
                 });
             }
         },
@@ -1050,12 +1150,19 @@ fn search_candidate(
         validated.total_lines,
         validated.has_trailing_newline,
     );
+    let paging_stamp =
+        if sink_output.entries_seen == 0 && transcoding_note.is_none() && !used_fallback {
+            snapshot.paging_stamp
+        } else {
+            None
+        };
     Ok(SearchOutcome {
         result: sink_output.result,
         entries_seen: sink_output.entries_seen,
         skip: None,
         transcoding_note,
         used_fallback,
+        paging_stamp,
     })
 }
 
@@ -1070,6 +1177,7 @@ fn search_candidates_ordered(
     multiline: bool,
     encoding: SearchEncoding,
     page_limit: usize,
+    page_reuse: Option<PageReuse>,
     mut consume: impl FnMut(
         usize,
         Result<SearchOutcome, SearchFailure>,
@@ -1081,8 +1189,35 @@ fn search_candidates_ordered(
     if !content {
         width = width.min(page_limit.max(1));
     }
-    let worker = move |_: usize, candidate: &Candidate, work: &WorkCtx| {
-        search_candidate_for_work(candidate, &matcher, plan, multiline, &encoding, work)
+    let worker = move |index: usize, candidate: &Candidate, work: &WorkCtx| {
+        let reuse = page_reuse.as_ref().filter(|_| index < PAGING_STAMP_LIMIT);
+        if let Some(stamp) = reuse
+            .and_then(|cache| cache.stamps.get(index))
+            .and_then(Option::as_ref)
+        {
+            work.check()?;
+            let unchanged = stamp.matches(candidate);
+            work.check()?;
+            if unchanged {
+                return Ok(Ok(SearchOutcome {
+                    result: None,
+                    entries_seen: 0,
+                    skip: None,
+                    transcoding_note: None,
+                    used_fallback: false,
+                    paging_stamp: Some(stamp.clone()),
+                }));
+            }
+        }
+        search_candidate_for_work(
+            candidate,
+            &matcher,
+            plan,
+            multiline,
+            &encoding,
+            work,
+            reuse.map(|cache| cache.volume),
+        )
     };
     let panic_candidates = Arc::clone(&candidates);
     let panic_value = move |index: usize, _| {
@@ -1156,8 +1291,17 @@ fn search_candidate_for_work(
     multiline: bool,
     encoding: &SearchEncoding,
     work: &WorkCtx,
+    paging_volume: Option<u64>,
 ) -> Result<Result<SearchOutcome, SearchFailure>, WorkStop> {
-    match search_candidate(candidate, matcher, plan, multiline, encoding, Some(work)) {
+    match search_candidate(
+        candidate,
+        matcher,
+        plan,
+        multiline,
+        encoding,
+        Some(work),
+        paging_volume,
+    ) {
         Err(SearchFailure::Cancelled) => Err(WorkStop::RequestCancelled),
         Err(SearchFailure::EpochRetired) => Err(WorkStop::EpochRetired),
         outcome => Ok(outcome),

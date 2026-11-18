@@ -248,6 +248,7 @@ pub(crate) struct SealedSnapshot {
     path: PathRecord,
     _before: FileIdentity,
     _after: FileIdentity,
+    pub(crate) paging_stamp: Option<PagingStamp>,
     captured: CapturedSnapshot,
 }
 
@@ -720,6 +721,7 @@ pub(crate) fn capture_classify(
     explicit_encoding: Option<&str>,
     fallback_encoding: Option<&str>,
     operation: Option<&dyn WorkCheckpoint>,
+    paging_volume: Option<u64>,
 ) -> Result<CaptureDisposition, CaptureFailure> {
     checkpoint(operation)?;
     let mut file = match open_original(&candidate.native) {
@@ -739,6 +741,9 @@ pub(crate) fn capture_classify(
         return Ok(CaptureDisposition::FileChanged);
     }
 
+    let before_usn = paging_volume
+        .filter(|volume| before.supports_paging(*volume))
+        .and_then(|_| file_change_number(&file));
     let capture = capture_reader(&mut file, explicit_encoding, fallback_encoding, operation)?;
     checkpoint(operation)?;
     #[cfg(test)]
@@ -751,7 +756,14 @@ pub(crate) fn capture_classify(
         Ok(identity) => identity,
         Err(error) => return Err(prefer_stop(operation, CaptureFailure::Io(error))),
     };
-    let path_identity = match identity_from_path(&candidate.native) {
+    // A stamp is useful across requests only if the post-capture identity
+    // check also confirms that no data-writing handle is still open.
+    let guarded = before_usn.and_then(|_| paging_path_identity(&candidate.native).ok());
+    let path_usn = guarded.as_ref().and_then(|(_, _, usn)| *usn);
+    let path_identity = match guarded.map_or_else(
+        || identity_from_path(&candidate.native),
+        |(identity, regular, _)| Ok((identity, regular)),
+    ) {
         Ok(identity) => identity,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             checkpoint(operation)?;
@@ -777,6 +789,14 @@ pub(crate) fn capture_classify(
         CaptureRead::Complete(captured) => {
             CaptureDisposition::Searchable(Box::new(SealedSnapshot {
                 path: candidate.clone(),
+                paging_stamp: path_usn
+                    .filter(|usn| {
+                        Some(*usn) == before_usn && before == after && after == path_identity.0
+                    })
+                    .map(|usn| PagingStamp {
+                        identity: path_identity.0,
+                        usn,
+                    }),
                 _before: before,
                 _after: after,
                 captured,
@@ -826,6 +846,10 @@ impl FileIdentity {
 
     fn same_state(&self, other: &Self) -> bool {
         self == other
+    }
+
+    fn supports_paging(&self, _volume: u64) -> bool {
+        false
     }
 }
 
@@ -953,6 +977,198 @@ impl FileIdentity {
                 _ => true,
             }
     }
+
+    fn supports_paging(&self, volume: u64) -> bool {
+        matches!(self.file_id, WindowsFileId::Extended { volume_serial, .. } if volume_serial == volume)
+            && self.change_time.is_some_and(|time| time > 0)
+    }
+}
+
+/// A previously checked file identity, reusable only on the search root's NTFS volume.
+#[derive(Clone, Debug)]
+pub(crate) struct PagingStamp {
+    identity: FileIdentity,
+    usn: i64,
+}
+
+impl PagingStamp {
+    pub(crate) fn matches(&self, candidate: &PathRecord) -> bool {
+        paging_path_identity(&candidate.native).is_ok_and(|(current, regular, usn)| {
+            regular
+                && self.identity == current
+                && Some(self.usn) == usn
+                && current.matches_hint(candidate.traversal_fingerprint.as_ref())
+        })
+    }
+}
+
+#[cfg(windows)]
+fn paging_path_identity(path: &Path) -> io::Result<(FileIdentity, bool, Option<i64>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+    // A writer can keep Windows timestamps pending until it closes. Treat a
+    // sharing conflict as a cache miss. Delete sharing keeps replacements observable.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)?;
+    let (identity, regular) = identity_from_file(&file)?;
+    Ok((identity, regular, file_change_number(&file)))
+}
+
+#[cfg(not(windows))]
+fn paging_path_identity(path: &Path) -> io::Result<(FileIdentity, bool, Option<i64>)> {
+    identity_from_path(path).map(|(identity, regular)| (identity, regular, None))
+}
+
+#[cfg(windows)]
+fn file_change_number(file: &File) -> Option<i64> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{
+        FSCTL_READ_FILE_USN_DATA, READ_FILE_USN_DATA, USN_RECORD_V2, USN_RECORD_V3,
+    };
+
+    let input = READ_FILE_USN_DATA {
+        MinMajorVersion: 2,
+        MaxMajorVersion: 3,
+    };
+    let mut record = [0_u8; 1024];
+    let mut received = 0_u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_READ_FILE_USN_DATA,
+            (&raw const input).cast(),
+            size_of::<READ_FILE_USN_DATA>() as u32,
+            record.as_mut_ptr().cast(),
+            record.len() as u32,
+            &mut received,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let record = record.get(..received as usize)?;
+    let version = u16::from_le_bytes(record.get(4..6)?.try_into().ok()?);
+    let start = match version {
+        2 => offset_of!(USN_RECORD_V2, Usn),
+        3 => offset_of!(USN_RECORD_V3, Usn),
+        _ => return None,
+    };
+    let usn = i64::from_le_bytes(record.get(start..start + 8)?.try_into().ok()?);
+    (usn > 0).then_some(usn)
+}
+
+#[cfg(not(windows))]
+fn file_change_number(_file: &File) -> Option<i64> {
+    None
+}
+
+pub(crate) struct PagingVolume {
+    pub(crate) serial: u64,
+    pub(crate) journal_id: u64,
+    directory: File,
+}
+
+impl PagingVolume {
+    pub(crate) fn journal_unchanged(&self) -> bool {
+        query_journal_id(&self.directory) == Some(self.journal_id)
+    }
+}
+
+#[cfg(windows)]
+fn query_journal_id(directory: &File) -> Option<u64> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{FSCTL_QUERY_USN_JOURNAL, USN_JOURNAL_DATA_V2};
+
+    let mut info = USN_JOURNAL_DATA_V2::default();
+    let mut received = 0_u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            directory.as_raw_handle(),
+            FSCTL_QUERY_USN_JOURNAL,
+            std::ptr::null(),
+            0,
+            (&raw mut info).cast(),
+            size_of::<USN_JOURNAL_DATA_V2>() as u32,
+            &mut received,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0 && received >= size_of::<u64>() as u32 && info.UsnJournalID != 0)
+        .then_some(info.UsnJournalID)
+}
+
+#[cfg(not(windows))]
+fn query_journal_id(_directory: &File) -> Option<u64> {
+    None
+}
+
+#[cfg(windows)]
+pub(crate) fn paging_volume(path: &Path) -> Option<PagingVolume> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, GetDriveTypeW,
+        GetVolumeInformationByHandleW,
+    };
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
+        return None;
+    };
+    let drive = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
+    const DRIVE_FIXED: u32 = 3;
+    if unsafe { GetDriveTypeW(drive.as_ptr()) } != DRIVE_FIXED {
+        return None;
+    }
+    let directory = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut name = [0_u16; 16];
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            directory.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    if ok == 0 || name[..5] != [b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0] {
+        return None;
+    }
+    let WindowsFileId::Extended {
+        volume_serial: serial,
+        ..
+    } = FileIdentity::from_file(&directory).ok()?.file_id
+    else {
+        return None;
+    };
+    let journal_id = query_journal_id(&directory)?;
+    Some(PagingVolume {
+        serial,
+        journal_id,
+        directory,
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn paging_volume(_path: &Path) -> Option<PagingVolume> {
+    None
 }
 
 #[cfg(windows)]
@@ -1387,7 +1603,7 @@ mod tests {
         let metadata = std::fs::metadata(&path).unwrap();
         let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
         let CaptureDisposition::Searchable(snapshot) =
-            capture_classify(&candidate, None, None, None).unwrap()
+            capture_classify(&candidate, None, None, None, None).unwrap()
         else {
             panic!("expected searchable snapshot");
         };
@@ -1432,7 +1648,7 @@ mod tests {
         let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
         std::fs::write(&path, b"different length").unwrap();
         assert!(matches!(
-            capture_classify(&candidate, None, None, None).unwrap(),
+            capture_classify(&candidate, None, None, None, None).unwrap(),
             CaptureDisposition::FileChanged
         ));
 
@@ -1443,7 +1659,7 @@ mod tests {
         std::fs::write(&path, b"same-two").unwrap();
         set_file_mtime(&path, FileTime::from_unix_time(1_700_000_010, 0)).unwrap();
         assert!(matches!(
-            capture_classify(&candidate, None, None, None).unwrap(),
+            capture_classify(&candidate, None, None, None, None).unwrap(),
             CaptureDisposition::FileChanged
         ));
 
@@ -1469,7 +1685,7 @@ mod tests {
         let (mut guard, operation) =
             RequestWorkGuard::new_with_hook(RequestId::Number(1), CancellationToken::new(), hook);
         assert!(matches!(
-            capture_classify(&candidate, None, None, Some(&operation)).unwrap(),
+            capture_classify(&candidate, None, None, Some(&operation), None).unwrap(),
             CaptureDisposition::FileChanged
         ));
         guard.disarm();
@@ -1493,7 +1709,7 @@ mod tests {
         let (mut guard, operation) =
             RequestWorkGuard::new_with_hook(RequestId::Number(2), CancellationToken::new(), hook);
         assert!(matches!(
-            capture_classify(&candidate, None, None, Some(&operation)).unwrap(),
+            capture_classify(&candidate, None, None, Some(&operation), None).unwrap(),
             CaptureDisposition::FileChanged
         ));
         guard.disarm();

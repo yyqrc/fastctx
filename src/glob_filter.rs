@@ -13,7 +13,7 @@ use std::path::Path;
 /// Parameters of this type publish the array form alone, because a union is the
 /// one construct no provider's tool-schema subset accepts; see `crate::tool_schema`.
 /// Both forms still deserialize, so callers written against either keep working.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
 #[serde(untagged)]
 pub enum GlobPatterns {
     One(String),
