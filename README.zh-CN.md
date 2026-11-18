@@ -249,12 +249,16 @@ V:/repo/src/edit/locks.rs
 (Complete: all 1 result shown.)
 ```
 
-`output_mode` 有四种取值：
+`output_mode` 决定返回哪些结果：
 
 - `files_with_matches`：返回命中文件；
+- `grouped_files`：按相同顺序返回命中文件。共同目录单列一行，下面缩进显示剩余路径。每一页都可以独立读取；
 - `content`：按文件分组展示匹配内容；
 - `count`：返回每个文件的 occurrence 数；
+- `grouped_count`：按路径排序展示每个文件的匹配次数，共同目录只写一次；
 - `summary`：完成全量扫描后返回总数。
+
+两种目录分组模式默认显示相对路径和跳过原因摘要。需要绝对路径时设置 `compact: false`，需要查看具体跳过的文件时设置 `summarize_skips: false`。
 
 `grep` 默认尊重 `.gitignore` 和 `.ignore`，包含隐藏文件，排除 `.git` 与二进制文件。常用筛选参数包括 `glob`、`type`、`case_insensitive`、`multiline` 和 `context`。结果通过 `head_limit` 与 `offset` 分页。
 

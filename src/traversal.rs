@@ -212,6 +212,7 @@ pub(crate) fn collect_search_candidates(
     root: &ResolvedRoot,
     glob: Option<&PathGlobFilter>,
     file_type: Option<&str>,
+    sort_by_path: bool,
     operation: Option<&OperationCtx>,
     executor: Option<&Arc<GrepGlobExecutor>>,
 ) -> Result<TraversalCollection<PathRecord>, String> {
@@ -233,7 +234,16 @@ pub(crate) fn collect_search_candidates(
         candidates = collected.items;
         skipped = collected.skipped;
     }
-    let items = sort_cancelable(candidates, compare_search_candidates, operation, executor)
+    let compare = if sort_by_path {
+        |a: &PathRecord, b: &PathRecord| {
+            a.display
+                .cmp(&b.display)
+                .then_with(|| a.native_key.cmp(&b.native_key))
+        }
+    } else {
+        compare_search_candidates
+    };
+    let items = sort_cancelable(candidates, compare, operation, executor)
         .map(|sorted| sorted.items)
         .map_err(|error| error.to_string())?;
     Ok(TraversalCollection { items, skipped })
@@ -248,7 +258,7 @@ pub(crate) fn collect_project_candidates(
     let metadata =
         fs::metadata(root).map_err(|error| crate::paths::io_error_message(root, &error))?;
     let resolved = ResolvedRoot::from_metadata(root.to_path_buf(), metadata)?;
-    collect_search_candidates(&resolved, glob, file_type, None, None).map(|collected| {
+    collect_search_candidates(&resolved, glob, file_type, false, None, None).map(|collected| {
         TraversalCollection {
             items: collected
                 .items

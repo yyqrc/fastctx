@@ -47,7 +47,7 @@ const MAX_MATCH_CHARS: usize = 2_000;
 const SEARCH_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const CAPTURE_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
-/// The four grep output modes.
+/// The grep output modes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputMode {
@@ -56,8 +56,12 @@ pub enum OutputMode {
     /// Return only paths of files containing at least one match.
     #[default]
     FilesWithMatches,
+    /// Return the same file order with shared directory headings.
+    GroupedFiles,
     /// Return per-file occurrence counts and their aggregate.
     Count,
+    /// Count then path, with repeated directories shown as headings.
+    GroupedCount,
     /// Scan the full scope and return only global occurrence and file totals.
     Summary,
 }
@@ -75,6 +79,8 @@ pub struct GrepRequest {
     pub path: Option<String>,
     /// For directory queries, return paths relative to the search root and group repeated skip reasons.
     pub compact: Option<bool>,
+    /// For directory searches, show counts by skip reason instead of individual skipped paths.
+    pub summarize_skips: Option<bool>,
     /// Globs to filter files, e.g. ["**/*.rs", "!tests/**"]. A leading `!` excludes and always wins; negative-only lists include every other file.
     // Published as a plain string array; see the note on GlobRequest::pattern. (2026-08-17)
     #[schemars(with = "Option<Vec<String>>")]
@@ -83,7 +89,7 @@ pub struct GrepRequest {
     #[serde(rename = "type")]
     #[schemars(rename = "type")]
     pub file_type: Option<String>,
-    /// "content" = matching lines with optional context; "files_with_matches" (default) = matching paths only; "count" = per-file counts plus their total; "summary" = global totals from a full scan (ignores head_limit/offset).
+    /// "content" = matching lines; "files_with_matches" (default) = paths; "grouped_files" = same order with directory headings; "count" = per-file counts; "grouped_count" = path-sorted counts with headings; grouped modes default to relative paths and skip summaries. "summary" = full-scan totals, ignoring head_limit/offset.
     pub output_mode: Option<OutputMode>,
     /// Case-insensitive search (rg -i).
     pub case_insensitive: Option<bool>,
@@ -214,6 +220,7 @@ struct PageFormat<'a> {
     total_entries_seen: usize,
     compact: bool,
     skipped_files: &'a SkippedFiles,
+    summarize_skips: bool,
     transcoding_notes: &'a BTreeSet<String>,
     fallback_usage: &'a FallbackUsage,
     single_file_target: bool,
@@ -447,11 +454,14 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         Ok(glob) => glob,
         Err(message) => return ToolResponse::error(message),
     };
-    let compact = request.compact.unwrap_or(false) && !single_file_target;
+    let mode = request.output_mode.unwrap_or_default();
+    let grouped = matches!(mode, OutputMode::GroupedFiles | OutputMode::GroupedCount);
+    let compact = request.compact.unwrap_or(grouped) && !single_file_target;
     let mut collected = match collect_search_candidates(
         &root,
         glob.as_ref(),
         request.file_type.as_deref(),
+        mode == OutputMode::GroupedCount,
         Some(&operation),
         Some(&executor),
     ) {
@@ -467,7 +477,6 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     let candidates = Arc::<[Candidate]>::from(collected.items);
     let offset = request.offset.unwrap_or(0);
     let head_limit = request.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
-    let mode = request.output_mode.unwrap_or_default();
     let only_matching = request.only_matching.unwrap_or(false);
     let (before_context, after_context) = if mode == OutputMode::Content {
         if let Some(context) = request.context {
@@ -487,31 +496,16 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips, &root, compact);
         let mut transcoding_notes = BTreeSet::new();
         let mut fallback_usage = FallbackUsage::default();
-        let plan = GrepSearchPlan::Count;
         let mut failure: Option<ToolResponse> = None;
-        let worker_matcher = Arc::clone(&matcher);
-        let worker_encoding = search_encoding.clone();
-        let panic_candidates = Arc::clone(&candidates);
-        let ordered = for_each_ordered(
+        let ordered = search_candidates_ordered(
             Arc::clone(&candidates),
             operation.clone(),
             Arc::clone(&executor),
-            move |_, candidate, work| {
-                search_candidate_for_work(
-                    candidate,
-                    &worker_matcher,
-                    plan,
-                    multiline,
-                    &worker_encoding,
-                    work,
-                )
-            },
-            move |index, _| {
-                Err(SearchFailure::Fatal(format!(
-                    "Search worker panicked while processing {}.",
-                    panic_candidates[index].display
-                )))
-            },
+            matcher,
+            GrepSearchPlan::Count,
+            multiline,
+            search_encoding,
+            usize::MAX,
             |index, outcome, _| {
                 let candidate = &candidates[index];
                 let outcome = match outcome {
@@ -563,6 +557,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
             total_entries_seen: 0,
             compact,
             skipped_files: &skipped_files,
+            summarize_skips: request.summarize_skips.unwrap_or(false),
             transcoding_notes: &transcoding_notes,
             fallback_usage: &fallback_usage,
             single_file_target: false,
@@ -593,8 +588,8 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     // exactly the entries the sequential pagination would have selected, so
     // the observable output stays byte-identical to a serial scan.
     let worker_plan = match mode {
-        OutputMode::FilesWithMatches => GrepSearchPlan::Exists,
-        OutputMode::Count => GrepSearchPlan::Count,
+        OutputMode::FilesWithMatches | OutputMode::GroupedFiles => GrepSearchPlan::Exists,
+        OutputMode::Count | OutputMode::GroupedCount => GrepSearchPlan::Count,
         OutputMode::Content => {
             let spec = ContentSpec {
                 multiline,
@@ -614,30 +609,16 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         OutputMode::Summary => unreachable!("summary is handled before paging"),
     };
     let mut failure: Option<String> = None;
-    let worker_matcher = Arc::clone(&matcher);
-    let worker_encoding = search_encoding.clone();
-    let panic_candidates = Arc::clone(&candidates);
-    let ordered = for_each_ordered(
+    let ordered = search_candidates_ordered(
         Arc::clone(&candidates),
         operation.clone(),
         Arc::clone(&executor),
-        move |_, candidate, work| {
-            search_candidate_for_work(
-                candidate,
-                &worker_matcher,
-                worker_plan,
-                multiline,
-                &worker_encoding,
-                work,
-            )
-        },
-        move |index, _| {
-            Err(SearchFailure::Fatal(format!(
-                "Search worker panicked while processing {}.",
-                panic_candidates[index].display
-            )))
-        },
-        |index, outcome, reducer| {
+        Arc::clone(&matcher),
+        worker_plan,
+        multiline,
+        search_encoding.clone(),
+        effective_head_limit,
+        |index, outcome, retire_generation| {
             let candidate = &candidates[index];
             let (outcome, exact_form) = match outcome {
                 Ok(outcome) => (outcome, false),
@@ -645,7 +626,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
                     // The over-capture cap can cross the 64 MiB capture valve
                     // where the live window would not; retry with the exact
                     // sequential options before surfacing the error.
-                    if let Err(error) = reducer.retire_generation() {
+                    if let Err(error) = retire_generation() {
                         failure = Some(ordered_error_message(error));
                         return ControlFlow::Break(());
                     }
@@ -769,6 +750,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         total_entries_seen,
         compact,
         skipped_files: &skipped_files,
+        summarize_skips: request.summarize_skips.unwrap_or(grouped),
         transcoding_notes: &transcoding_notes,
         fallback_usage: &fallback_usage,
         single_file_target,
@@ -783,8 +765,10 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     }
 
     match mode {
-        OutputMode::FilesWithMatches => format_files_mode(&results, &page),
-        OutputMode::Count => format_count_mode(&results, &page),
+        OutputMode::FilesWithMatches | OutputMode::GroupedFiles => {
+            format_files_mode(&results, &page, grouped)
+        }
+        OutputMode::Count | OutputMode::GroupedCount => format_count_mode(&results, &page, grouped),
         OutputMode::Content => format_content_mode(&results, &request, &page),
         OutputMode::Summary => unreachable!("summary is handled before paging"),
     }
@@ -951,7 +935,7 @@ fn search_candidate(
         .flatten();
     let mut searcher = SearcherBuilder::new();
     searcher
-        .line_number(true)
+        .line_number(plan.content_multiline().is_some())
         .line_terminator(LineTerminator::crlf())
         .multi_line(multiline)
         .before_context(plan.before_context())
@@ -1062,7 +1046,7 @@ fn search_candidate(
         });
     }
     let sink_output = sink.into_output(
-        candidate.display.to_string(),
+        &candidate.display,
         validated.total_lines,
         validated.has_trailing_newline,
     );
@@ -1073,6 +1057,96 @@ fn search_candidate(
         transcoding_note,
         used_fallback,
     })
+}
+
+/// Batch sparse scans without retaining more than one content capture per worker.
+#[allow(clippy::too_many_arguments)]
+fn search_candidates_ordered(
+    candidates: Arc<[Candidate]>,
+    operation: OperationCtx,
+    executor: Arc<GrepGlobExecutor>,
+    matcher: Arc<RegexMatcher>,
+    plan: GrepSearchPlan,
+    multiline: bool,
+    encoding: SearchEncoding,
+    page_limit: usize,
+    mut consume: impl FnMut(
+        usize,
+        Result<SearchOutcome, SearchFailure>,
+        &dyn Fn() -> Result<(), OrderedError>,
+    ) -> ControlFlow<()>,
+) -> Result<(), OrderedError> {
+    let content = plan.content_multiline().is_some();
+    let mut width = (candidates.len() / executor.parallelism()).clamp(1, 16);
+    if !content {
+        width = width.min(page_limit.max(1));
+    }
+    let worker = move |_: usize, candidate: &Candidate, work: &WorkCtx| {
+        search_candidate_for_work(candidate, &matcher, plan, multiline, &encoding, work)
+    };
+    let panic_candidates = Arc::clone(&candidates);
+    let panic_value = move |index: usize, _| {
+        Err(SearchFailure::Fatal(format!(
+            "Search worker panicked while processing {}.",
+            panic_candidates[index].display
+        )))
+    };
+    if width == 1 {
+        return for_each_ordered(
+            candidates,
+            operation,
+            executor,
+            worker,
+            panic_value,
+            move |i, outcome, reducer| consume(i, outcome, &|| reducer.retire_generation()),
+        );
+    }
+    let starts: Arc<[usize]> = (0..candidates.len()).step_by(width).collect();
+    let file_panic = panic_value.clone();
+    let count = candidates.len();
+    let run_file = move |i: usize, work: &WorkCtx| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker(i, &candidates[i], work)
+        }))
+        .unwrap_or_else(|payload| Ok(file_panic(i, payload)))
+    };
+    let inline_run = run_file.clone();
+    let inline_work = operation.inline_work();
+    for_each_ordered(
+        starts,
+        operation,
+        executor,
+        move |_, &start, work| {
+            let end = (start + width).min(count);
+            let mut results = Vec::with_capacity(end - start);
+            for i in start..end {
+                let outcome = run_file(i, work)?;
+                // Keep the first capture or error as the last item. The reducer
+                // can then stop at the page boundary or replay an overflow
+                // before any more files from this batch are searched.
+                let stop = content && !matches!(&outcome, Ok(hit) if hit.result.is_none());
+                results.push(outcome);
+                if stop {
+                    break;
+                }
+            }
+            Ok(results)
+        },
+        move |batch, payload| vec![panic_value(batch * width, payload)],
+        move |batch, results, reducer| {
+            let start = batch * width;
+            let resume = start + results.len();
+            let retire = || reducer.retire_generation();
+            for (i, result) in (start..).zip(results) {
+                consume(i, result, &retire)?;
+            }
+            for i in resume..(start + width).min(count) {
+                let result = inline_run(i, &inline_work).unwrap_or(Err(SearchFailure::Cancelled));
+                consume(i, result, &retire)?;
+            }
+            ControlFlow::Continue(())
+        },
+    )
 }
 
 fn search_candidate_for_work(
@@ -1166,6 +1240,8 @@ impl PageFormat<'_> {
 struct GrepNoteUnits {
     fixed: Vec<Arc<str>>,
     details: Vec<Arc<str>>,
+    /// In summary mode, maps a prefix of reason lines to the number of paths covered.
+    summarized_paths: Vec<usize>,
     fallback: Option<Arc<str>>,
     tally: SkipTally,
 }
@@ -1177,8 +1253,28 @@ impl GrepNoteUnits {
             .iter()
             .map(|line| Arc::<str>::from(line.as_str()))
             .collect();
-        let mut details = Vec::with_capacity(page.skipped_files.entries.len());
-        if page.compact {
+        let mut details = Vec::new();
+        let mut summarized_paths = Vec::new();
+        let mut tally = page.skipped_files.tally();
+        if page.summarize_skips {
+            let mut counts = BTreeMap::<&str, usize>::new();
+            for entry in &page.skipped_files.entries {
+                *counts.entry(&entry.reason).or_default() += 1;
+            }
+            let unknown = page.skipped_files.unreachable_unlisted;
+            if unknown > 0 {
+                *counts
+                    .entry("unreachable (reason unavailable)")
+                    .or_default() += unknown;
+                tally.listed += unknown;
+            }
+            let mut covered = 0;
+            for (reason, count) in counts {
+                details.push(Arc::from(format!("{reason}: {count}")));
+                covered += count;
+                summarized_paths.push(covered);
+            }
+        } else if page.compact {
             let mut groups = BTreeMap::<&str, Vec<&str>>::new();
             for entry in &page.skipped_files.entries {
                 groups.entry(&entry.reason).or_default().push(&entry.path);
@@ -1210,8 +1306,19 @@ impl GrepNoteUnits {
             fixed,
             details,
             fallback,
-            tally: page.skipped_files.tally(),
+            tally,
+            summarized_paths,
         }
+    }
+
+    fn terminal(&self, terminal: &str, lines: usize) -> Result<String, RenderPlanError> {
+        let shown = if self.summarized_paths.is_empty() || lines == 0 {
+            lines
+        } else {
+            self.summarized_paths[lines - 1]
+        };
+        crate::skip_report::terminal_with_skips(terminal, &self.tally, shown)
+            .ok_or(RenderPlanError::InvalidTerminal)
     }
 
     fn tail(&self, terminal: Arc<str>) -> Vec<Arc<str>> {
@@ -1240,7 +1347,7 @@ impl GrepNoteUnits {
     }
 
     fn baseline_notes(&self, terminal: &str) -> Result<Vec<Arc<str>>, RenderPlanError> {
-        let terminal = Arc::<str>::from(terminal_with_skips(terminal, &self.tally, 0)?);
+        let terminal = Arc::<str>::from(self.terminal(terminal, 0)?);
         Ok(self.final_notes(0, terminal))
     }
 }
@@ -1381,14 +1488,13 @@ fn select_grep_notes(
     )?;
     let total_skipped = notes.details.len();
 
-    let full_terminal =
-        Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, total_skipped)?);
+    let full_terminal = Arc::<str>::from(notes.terminal(terminal, total_skipped)?);
     let full_tail = notes.tail(Arc::clone(&full_terminal));
     let full_tokens = details.probe_tail(total_skipped, &full_tail, page.work())?;
     let (shown_skips, selected_terminal, selected_tokens) = if full_tokens <= page.budget {
         (total_skipped, full_terminal, full_tokens)
     } else {
-        let baseline_terminal = Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, 0)?);
+        let baseline_terminal = Arc::<str>::from(notes.terminal(terminal, 0)?);
         let baseline_tail = notes.tail(Arc::clone(&baseline_terminal));
         let baseline_tokens = details.probe_tail(0, &baseline_tail, page.work())?;
         if baseline_tokens > page.budget {
@@ -1404,8 +1510,7 @@ fn select_grep_notes(
                 total_skipped - 1,
                 Some(baseline.clone()),
                 |middle| -> Result<Option<(usize, Arc<str>, usize)>, RenderPlanError> {
-                    let candidate_terminal =
-                        Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, middle)?);
+                    let candidate_terminal = Arc::<str>::from(notes.terminal(terminal, middle)?);
                     let candidate_tail = notes.tail(Arc::clone(&candidate_terminal));
                     let candidate_tokens =
                         details.probe_tail(middle, &candidate_tail, page.work())?;
@@ -1434,15 +1539,24 @@ fn grep_render_failure(error: RenderPlanError) -> ToolResponse {
     }
 }
 
-fn format_files_mode(results: &[FileResult], page: &PageFormat<'_>) -> ToolResponse {
+fn format_files_mode(results: &[FileResult], page: &PageFormat<'_>, grouped: bool) -> ToolResponse {
     let initial = if page.head_limit == 0 {
         results.len()
     } else {
         page.head_limit.min(results.len())
     };
-    let lines = results[..initial]
+    let rows = &results[..initial];
+    let mut active_directory = "";
+    let lines = rows
         .iter()
-        .map(|result| Arc::<str>::from(result.path()))
+        .enumerate()
+        .map(|(i, result)| {
+            if grouped {
+                Arc::from(grouped_line(&rows[i..], &mut active_directory, false))
+            } else {
+                Arc::from(result.path())
+            }
+        })
         .collect::<Vec<_>>();
     let mut graph = match LineRenderGraph::new(lines, page.work()) {
         Ok(graph) => graph,
@@ -1463,7 +1577,50 @@ fn format_files_mode(results: &[FileResult], page: &PageFormat<'_>) -> ToolRespo
     finish_selected_grep_body(&mut graph, selected, page, &notes)
 }
 
-fn format_count_mode(results: &[FileResult], page: &PageFormat<'_>) -> ToolResponse {
+/// Complete path components only, even when two UTF-8 names first differ inside a character.
+fn shared_directory<'a>(path: &'a str, next: &str) -> &'a str {
+    let mut end = 0;
+    for (i, (a, b)) in path.bytes().zip(next.bytes()).enumerate() {
+        if a != b {
+            break;
+        }
+        if a == b'/' {
+            end = i + 1;
+        }
+    }
+    &path[..end]
+}
+
+fn grouped_line<'a>(rows: &'a [FileResult], active: &mut &'a str, with_count: bool) -> String {
+    let path = rows[0].path();
+    let mut line = String::new();
+    if !path.starts_with(*active) {
+        *active = "";
+    }
+    if let Some(next) = rows.get(1) {
+        let prefix = shared_directory(path, next.path());
+        // Switching away from a usable heading repeats it in full. Reserve
+        // that switch for runs of at least three files under the deeper one.
+        if prefix.len() > active.len()
+            && (active.is_empty() || rows.get(2).is_some_and(|r| r.path().starts_with(prefix)))
+        {
+            *active = prefix;
+            line.push_str(prefix);
+            line.push('\n');
+        }
+    }
+    if !active.is_empty() {
+        line.push('\t');
+    }
+    if with_count {
+        use std::fmt::Write;
+        write!(line, "{} ", rows[0].occurrence_count()).expect("write to String");
+    }
+    line.push_str(&path[active.len()..]);
+    line
+}
+
+fn format_count_mode(results: &[FileResult], page: &PageFormat<'_>, grouped: bool) -> ToolResponse {
     let initial = if page.head_limit == 0 {
         results.len()
     } else {
@@ -1472,18 +1629,23 @@ fn format_count_mode(results: &[FileResult], page: &PageFormat<'_>) -> ToolRespo
     let mut occurrence_prefix = Vec::with_capacity(initial.saturating_add(1));
     occurrence_prefix.push(0_usize);
     let mut lines = Vec::with_capacity(initial);
-    for result in &results[..initial] {
+    let rows = &results[..initial];
+    let mut active_directory = "";
+    for (i, result) in rows.iter().enumerate() {
         let next = occurrence_prefix
             .last()
             .copied()
             .unwrap_or(0)
             .saturating_add(result.occurrence_count());
         occurrence_prefix.push(next);
-        lines.push(Arc::<str>::from(format!(
-            "{}:{}",
-            result.path(),
-            result.occurrence_count()
-        )));
+        let path = result.path();
+        let count = result.occurrence_count();
+        let line = if grouped {
+            grouped_line(&rows[i..], &mut active_directory, true)
+        } else {
+            format!("{path}:{count}")
+        };
+        lines.push(Arc::<str>::from(line));
     }
     let mut graph = match LineRenderGraph::new(lines, page.work()) {
         Ok(graph) => graph,
@@ -2322,15 +2484,6 @@ fn format_context_line(prefix: String, line: ResultLine<'_>) -> io::Result<Strin
     }
 }
 
-fn terminal_with_skips(
-    terminal: &str,
-    tally: &SkipTally,
-    shown: usize,
-) -> Result<String, RenderPlanError> {
-    crate::skip_report::terminal_with_skips(terminal, tally, shown)
-        .ok_or(RenderPlanError::InvalidTerminal)
-}
-
 fn format_summary(occurrences: usize, files: usize, page: &PageFormat<'_>) -> ToolResponse {
     let terminal = format!(
         "(Complete: {} across {}.)",
@@ -2342,8 +2495,10 @@ fn format_summary(occurrences: usize, files: usize, page: &PageFormat<'_>) -> To
 
 fn zero_result(mode: OutputMode, page: &PageFormat<'_>) -> ToolResponse {
     let terminal = match mode {
-        OutputMode::FilesWithMatches => "(Complete: no files matched.)",
-        OutputMode::Content | OutputMode::Count => "(Complete: no matches found.)",
+        OutputMode::FilesWithMatches | OutputMode::GroupedFiles => "(Complete: no files matched.)",
+        OutputMode::Content | OutputMode::Count | OutputMode::GroupedCount => {
+            "(Complete: no matches found.)"
+        }
         OutputMode::Summary => unreachable!("summary has its own zero-count response"),
     };
     terminal_only_response(terminal.to_string(), page)
@@ -2352,7 +2507,10 @@ fn zero_result(mode: OutputMode, page: &PageFormat<'_>) -> ToolResponse {
 fn offset_exhausted(mode: OutputMode, page: &PageFormat<'_>) -> ToolResponse {
     let (singular, plural) = match mode {
         OutputMode::Content => ("result", "results"),
-        OutputMode::FilesWithMatches | OutputMode::Count => ("file", "files"),
+        OutputMode::FilesWithMatches
+        | OutputMode::GroupedFiles
+        | OutputMode::Count
+        | OutputMode::GroupedCount => ("file", "files"),
         OutputMode::Summary => unreachable!("summary ignores offset"),
     };
     let offset = page.offset;

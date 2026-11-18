@@ -249,12 +249,16 @@ V:/repo/src/edit/locks.rs
 (Complete: all 1 result shown.)
 ```
 
-`output_mode` has four values:
+`output_mode` selects what to return:
 
 - `files_with_matches`: return matching files;
+- `grouped_files`: list the same files in the same order, with a shared directory on its own line and its paths indented. Each page can be read independently;
 - `content`: show matches grouped by file;
 - `count`: return the occurrence count for each file;
+- `grouped_count`: show file counts in path order with shared directory headings;
 - `summary`: scan the full target and return global totals.
+
+Both grouped modes default to relative paths and a skip summary. Set `compact: false` for absolute paths or `summarize_skips: false` for individual skipped paths.
 
 `grep` respects `.gitignore` and `.ignore` by default, includes hidden files, and excludes `.git` and binary files. Common filters include `glob`, `type`, `case_insensitive`, `multiline`, and `context`. Page through results with `head_limit` and `offset`.
 

@@ -295,6 +295,27 @@ impl EncodingPipeline<'_> {
         options: PassOptions,
     ) -> Result<PassResult, EncodingPipelineFailure> {
         candidate_checkpoint(self.operation)?;
+        // A complete UTF-8 snapshot within one decode chunk needs no reader or
+        // streaming decoder. Larger inputs keep the normal cancellation cadence.
+        if detected.kind == EncodingKind::EncodingRs(UTF_8)
+            && !options.enforce_legacy_hard_checks
+            && let ByteSource::Snapshot(snapshot) = self.source
+            && let Some(bytes) = snapshot.memory_bytes()
+            && bytes.len() <= self.chunk_bytes
+        {
+            encoding_chunk_checkpoint(self.operation)?;
+            let stats = std::str::from_utf8(&bytes[detected.bom_len as usize..])
+                .ok()
+                .map(|text| {
+                    let mut stats = ValidationStats::default();
+                    stats.observe(text);
+                    stats
+                });
+            return Ok(PassResult {
+                stats,
+                ..PassResult::invalid()
+            });
+        }
         if options.enforce_legacy_hard_checks
             && !matches!(detected.kind, EncodingKind::EncodingRs(_))
         {

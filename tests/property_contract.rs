@@ -251,12 +251,97 @@ fn compact_search_preserves_paths_counts_and_grouped_encoding_diagnostics() {
     }
     assert_eq!(original.lines().last(), compact.lines().last());
 
+    for compact_paths in [false, true] {
+        let args = serde_json::json!({"path": root, "pattern": "needle",
+            "output_mode": "count", "compact": compact_paths, "summarize_skips": true});
+        let summary = text(grep_files(serde_json::from_value(args).unwrap()));
+        let expected = if compact_paths { &compact } else { &original };
+        assert_eq!(summary.lines().next(), expected.lines().next());
+        assert_eq!(summary.lines().last(), expected.lines().last());
+        assert!(
+            summary
+                .lines()
+                .any(|l| l.starts_with("ambiguous:") && l.ends_with(": 2"))
+        );
+        assert!(!summary.contains("a.txt") && !summary.contains("b.txt"));
+    }
+
     let args = serde_json::json!({"path":root, "pattern":"**/hit.txt",
         "compact":true, "output_mode":"details"});
     let output = text(glob_files(serde_json::from_value(args).unwrap()));
     let detail: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
     assert_eq!(detail["path"], "sub/hit.txt");
     assert_eq!(detail["bytes"], 13);
+}
+
+#[test]
+fn grouped_files_preserve_ordinary_page_order_and_restart_headings() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in [
+        "a/1.txt",
+        "a/2.txt",
+        "a/3.txt",
+        "中/甲.txt",
+        "中/申.txt",
+        "z.txt",
+    ] {
+        write(&tmp.path().join(name), b"hit");
+    }
+    for (offset, limit) in [(0, 6), (1, 3), (2, 1), (5, 3), (6, 1)] {
+        let page = |mode| {
+            let args = serde_json::json!({"path": normalized(tmp.path()), "pattern":"hit",
+                "compact":true, "output_mode":mode, "offset":offset, "head_limit":limit});
+            text(grep_files(serde_json::from_value(args).unwrap()))
+        };
+        let ordinary = page("files_with_matches");
+        let grouped = page("grouped_files");
+        if offset == 6 {
+            assert_eq!(grouped, ordinary);
+            assert!(grouped.starts_with("(Complete: no files at offset=6;"));
+            continue;
+        }
+        let (body, footer) = split_terminal(&grouped);
+        let (expected, expected_footer) = split_terminal(&ordinary);
+        assert_eq!(footer, expected_footer);
+        let mut directory = "";
+        let mut paths = Vec::new();
+        for line in body.lines().filter(|line| !line.is_empty()) {
+            if line.ends_with('/') {
+                directory = line;
+            } else if let Some(relative) = line.strip_prefix('\t') {
+                assert!(!directory.is_empty());
+                paths.push(format!("{directory}{relative}"));
+            } else {
+                paths.push(line.to_string());
+            }
+        }
+        assert_eq!(paths.join("\n"), expected.trim_end());
+        if offset == 0 {
+            assert!(body.contains("/\n\t"));
+        }
+    }
+}
+
+#[test]
+fn grouped_counts_restate_directories_on_each_page_and_count_files_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["a/1.txt", "a/2.txt", "a/3.txt", "b/4.txt", "z.txt"] {
+        write(&tmp.path().join(name), b"hit hit");
+    }
+    let page = |offset, limit| {
+        let params = serde_json::json!({"path": normalized(tmp.path()), "pattern":"hit",
+            "output_mode":"grouped_count", "offset":offset, "head_limit":limit});
+        text(grep_files(serde_json::from_value(params).unwrap()))
+    };
+    assert!(page(0, 5).starts_with("a/\n\t2 1.txt\n\t2 2.txt\n\t2 3.txt\n2 b/4.txt\n2 z.txt\n"));
+    assert!(page(1, 2).starts_with("a/\n\t2 2.txt\n\t2 3.txt\n"));
+    assert!(page(2, 1).starts_with("2 a/3.txt\n"));
+
+    for name in ["中/甲/1.txt", "中/申/2.txt", "中/申/3.txt", "中/申/4.txt"] {
+        write(&tmp.path().join(name), b"hit");
+    }
+    // 甲 and 申 share UTF-8 bytes; a heading must stop at a slash.
+    assert!(page(5, 4).starts_with("中/\n\t1 甲/1.txt\n中/申/\n\t1 2.txt\n\t1 3.txt\n\t1 4.txt\n"));
 }
 
 #[test]
@@ -438,6 +523,7 @@ fn grep_occurrence_pages_reassemble_without_duplicates_or_gaps_across_a_matrix()
                 pattern: "HIT".to_string(),
                 path: Some(normalized(&path)),
                 compact: None,
+                summarize_skips: None,
                 glob: None,
                 file_type: None,
                 output_mode: Some(OutputMode::Content),

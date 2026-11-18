@@ -600,11 +600,16 @@ impl Utf8PrefixScanner {
         if self.abandoned {
             return None;
         }
-        let mut combined = std::mem::take(&mut self.carry);
-        combined.extend_from_slice(input);
-        match std::str::from_utf8(&combined) {
+        let mut carried = std::mem::take(&mut self.carry);
+        let combined = if carried.is_empty() {
+            input
+        } else {
+            carried.extend_from_slice(input);
+            &carried
+        };
+        match std::str::from_utf8(combined) {
             Ok(_) => {
-                self.observe_valid(&combined);
+                self.observe_valid(combined);
                 self.absolute_base = self.absolute_base.saturating_add(combined.len());
                 None
             }
@@ -644,9 +649,11 @@ impl Utf8PrefixScanner {
 
     fn observe_valid(&mut self, bytes: &[u8]) {
         self.valid_bytes = self.valid_bytes.saturating_add(bytes.len());
-        self.non_ascii_bytes = self
-            .non_ascii_bytes
-            .saturating_add(bytes.iter().filter(|byte| !byte.is_ascii()).count());
+        if self.non_ascii_bytes < UTF8_SEGMENT_MIN_NON_ASCII_BYTES && !bytes.is_ascii() {
+            self.non_ascii_bytes = self
+                .non_ascii_bytes
+                .saturating_add(bytes.iter().filter(|byte| !byte.is_ascii()).count());
+        }
     }
 
     fn clear_prefix(&self) -> bool {
@@ -681,11 +688,13 @@ impl ValidationStats {
         }
         self.decoded_any = true;
         self.has_non_ascii |= !text.is_ascii();
-        for byte in text.bytes() {
-            if self.previous_was_escape && matches!(byte, b'(' | b'$') {
-                self.has_iso_2022_escape = true;
-            }
-            self.previous_was_escape = byte == 0x1B;
+        if !self.has_iso_2022_escape {
+            self.has_iso_2022_escape = (self.previous_was_escape
+                && matches!(text.as_bytes()[0], b'(' | b'$'))
+                || text
+                    .match_indices('\x1b')
+                    .any(|(i, _)| matches!(text.as_bytes().get(i + 1), Some(b'(' | b'$')));
+            self.previous_was_escape = text.ends_with('\x1b');
         }
         self.newline_count = self
             .newline_count
@@ -725,6 +734,19 @@ impl StrictStreamingValidator {
     pub(crate) fn feed(&mut self, input: &[u8]) -> bool {
         if self.malformed {
             return true;
+        }
+        // Validation only needs the unfinished suffix, never an owned decoded string.
+        if let ChunkDecoder::Utf8 { carry } = &mut self.decoder
+            && carry.is_empty()
+        {
+            if let Err(error) = std::str::from_utf8(input) {
+                if error.error_len().is_some() {
+                    self.malformed = true;
+                } else {
+                    carry.extend_from_slice(&input[error.valid_up_to()..]);
+                }
+            }
+            return self.malformed;
         }
         let result = match &mut self.decoder {
             ChunkDecoder::Utf8 { carry } => decode_utf8_chunk(carry, input, false),

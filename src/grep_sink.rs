@@ -889,18 +889,18 @@ impl<'a> PlanSink<'a> {
 
     pub(crate) fn into_output(
         self,
-        path: String,
+        path: &str,
         total_lines: usize,
         has_trailing_newline: bool,
     ) -> SinkOutput {
         match self.inner {
             PlanSinkKind::Exists(sink) => SinkOutput {
-                result: sink.matched.then(|| FileResult::exists(path)),
+                result: sink.matched.then(|| FileResult::exists(path.to_owned())),
                 entries_seen: usize::from(sink.matched),
             },
             PlanSinkKind::Count(sink) => SinkOutput {
                 result: (sink.occurrence_total > 0)
-                    .then(|| FileResult::count(path, sink.occurrence_total)),
+                    .then(|| FileResult::count(path.to_owned(), sink.occurrence_total)),
                 entries_seen: usize::from(sink.occurrence_total > 0),
             },
             PlanSinkKind::Content(sink) => {
@@ -908,7 +908,7 @@ impl<'a> PlanSink<'a> {
                 let entries_seen = sink.entries_seen;
                 let result = (!sink.entries.is_empty()).then(|| {
                     FileResult::with_content(
-                        path,
+                        path.to_owned(),
                         ContentPayload {
                             lines: sink.lines,
                             occurrences: sink.occurrences,

@@ -962,8 +962,19 @@ fn filetime_u64(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 
 #[cfg(windows)]
 fn identity_from_file(file: &File) -> io::Result<(FileIdentity, bool)> {
-    let metadata = file.metadata()?;
-    Ok((FileIdentity::from_file(file)?, metadata.is_file()))
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let identity = FileIdentity::from_file(file)?;
+    // Reparse points need the tag-aware classification from std. Ordinary
+    // handles already supplied the directory bit in the same identity read.
+    let regular = if identity.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        file.metadata()?.is_file()
+    } else {
+        identity.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    };
+    Ok((identity, regular))
 }
 
 #[cfg(windows)]
